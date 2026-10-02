@@ -104,8 +104,8 @@ class TiledLinear:
     w: torch.Tensor                  # flat tiled bytes (uint8) or bf16
     scales: torch.Tensor | None      # kernel-order scales (FP8)
     rg_scale: torch.Tensor | None    # [N/16, K/128] (FP8), for untiling
-    parts: tuple[tuple[str, int], ...]  # (name, rows) of fused sources, in row order
-    interleave: int = 0              # gate/up: rows per half-tile (0 = plain stacking)
+    parts: tuple[tuple[str, int], ...]  # (name, rows) of fused sources, concatenated = "source order"
+    inv_perm: torch.Tensor | None = None  # source row j sits at kernel row inv_perm[j] (None: identity)
 
     def matmul(self, x: torch.Tensor, precise: bool = False, block_rows: int = 2048) -> torch.Tensor:
         """y = x @ W^T (bf16 out), dequantizing one block of tiles at a time to bound memory.
@@ -129,9 +129,8 @@ class TiledLinear:
             outs.append(xin @ wb.T)
             del wb
         y = torch.cat(outs, dim=-1)
-        if self.interleave:
-            lead = y.shape[:-1]
-            y = y.view(*lead, t.n // (2 * self.interleave), 2, self.interleave).transpose(-3, -2).reshape(*lead, t.n)
+        if self.inv_perm is not None:
+            y = y[..., self.inv_perm]
         return y.to(torch.bfloat16)
 
     def dense(self, dtype=torch.bfloat16) -> torch.Tensor:
@@ -141,9 +140,8 @@ class TiledLinear:
             w = layout.dequant(w, self.rg_scale, dtype)
         else:
             w = w.to(dtype)
-        if self.interleave:
-            n, k = w.shape
-            w = w.view(n // (2 * self.interleave), 2, self.interleave, k).transpose(0, 1).reshape(n, k)
+        if self.inv_perm is not None:
+            w = w[self.inv_perm]
         return w
 
     def split_dense(self, dtype=torch.bfloat16) -> dict[str, torch.Tensor]:
@@ -182,14 +180,52 @@ class FullLayerWeights:
     k_norm: torch.Tensor
 
 
-# Rows per task for each matrix; picked so every op has >= ~160 tasks on 170 SMs.
+# Rows per tile for each matrix; picked so every op has >= ~160 tasks on 170 SMs.
 TILE_QKVZ = 32
 TILE_AB = 32
-TILE_OUT = 16
+TILE_OUT = 32  # o_proj K-splits must land on 1536-wide kv-head groups: KC = 512
 TILE_GATE_UP = 32
 TILE_DOWN = 16
 TILE_QKV = 32
 TILE_LM_HEAD = 64
+
+
+# K-splits of the GEMMs that consume per-head outputs / the MLP hidden state,
+# so they can start on the part of their input that is already done.
+KSPLIT_OUT = 4      # GDN out_proj: 12 heads (4 key heads) per split
+KSPLIT_O = 4        # attention o_proj: one split per kv-head group
+KSPLIT_DOWN = 2     # down_proj: hidden 0..8191 | 8192..17407
+
+
+def qkvz_order(nk: int = 16, dk: int = 128, nv: int = 48, dv: int = 128) -> torch.Tensor:
+    """Source rows [q | k | v | z] regrouped per key head: q[kh] k[kh] v[3kh:3kh+3] z[3kh:3kh+3]."""
+    g = nv // nk
+    q0, k0, v0, z0 = 0, nk * dk, 2 * nk * dk, 2 * nk * dk + nv * dv
+    rows = []
+    for kh in range(nk):
+        rows += [torch.arange(q0 + kh * dk, q0 + (kh + 1) * dk), torch.arange(k0 + kh * dk, k0 + (kh + 1) * dk),
+                 torch.arange(v0 + kh * g * dv, v0 + (kh + 1) * g * dv),
+                 torch.arange(z0 + kh * g * dv, z0 + (kh + 1) * g * dv)]
+    return torch.cat(rows)
+
+
+def qkv_order(nq: int = 24, nkv: int = 4, hd: int = 256) -> torch.Tensor:
+    """Source rows [q_proj (query|gate per head) | k | v] regrouped per kv head."""
+    g = nq // nkv
+    k0, v0 = nq * 2 * hd, nq * 2 * hd + nkv * hd
+    rows = []
+    for kv in range(nkv):
+        rows += [torch.arange(kv * g * 2 * hd, (kv + 1) * g * 2 * hd),
+                 torch.arange(k0 + kv * hd, k0 + (kv + 1) * hd), torch.arange(v0 + kv * hd, v0 + (kv + 1) * hd)]
+    return torch.cat(rows)
+
+
+def gate_up_order(inter: int, tile_n: int) -> torch.Tensor:
+    """Source rows [gate | up]: each tile holds tile_n/2 gate rows then the matching up rows."""
+    half = tile_n // 2
+    t = torch.arange(inter // half)
+    gate = (t[:, None] * half + torch.arange(half)[None, :])
+    return torch.stack([gate, gate + inter], 1).reshape(-1)
 
 
 @dataclass
@@ -206,7 +242,7 @@ class Weights:
         cfg = Config.load(ckpt)
         if layers is not None:
             cfg = _truncate(cfg, layers)
-        loader = _Loader(ckpt, device)
+        loader = _Loader(ckpt, device, cfg.inter)
         out: list[LinearLayerWeights | FullLayerWeights] = []
         for i in range(cfg.layers):
             out.append(loader.linear_layer(i) if cfg.is_linear(i) else loader.full_layer(i))
@@ -228,7 +264,8 @@ def _truncate(cfg: Config, layers: int) -> Config:
 
 
 class _Loader:
-    def __init__(self, ckpt: Path, device: torch.device):
+    def __init__(self, ckpt: Path, device: torch.device, inter: int):
+        self.inter = inter
         self.ckpt = ckpt
         self.device = device
         self.index = json.loads((ckpt / "model.safetensors.index.json").read_text())["weight_map"]
@@ -254,7 +291,8 @@ class _Loader:
         s = self.get(name + ".weight_scale_inv").float()
         return w.view(torch.uint8), layout.row_group_scales(s, w.shape[0])
 
-    def fp8_linear(self, parts: list[tuple[str, str]], tile_n: int) -> TiledLinear:
+    def fp8_linear(self, parts: list[tuple[str, str]], tile_n: int, order: torch.Tensor | None = None) -> TiledLinear:
+        """Fuse FP8 matrices by rows (in `parts` order), then reorder rows by `order` (kernel row → source row)."""
         ws, rgs, meta = [], [], []
         for short, name in parts:
             w, rg = self._fp8(name)
@@ -264,20 +302,20 @@ class _Loader:
         w = torch.cat(ws) if len(ws) > 1 else ws[0]
         rg = torch.cat(rgs) if len(rgs) > 1 else rgs[0]
         del ws, rgs
-        return _tile_fp8(w, rg, tile_n, tuple(meta))
+        inv = None
+        if order is not None:
+            order = order.to(w.device)
+            assert order.numel() == w.shape[0] and bool((order.view(-1, 16)[:, 0] % 16 == 0).all())
+            w = w[order]
+            rg = rg[order.view(-1, 16)[:, 0] // 16]
+            inv = torch.argsort(order)
+        tl = _tile_fp8(w, rg, tile_n, tuple(meta))
+        tl.inv_perm = inv
+        return tl
 
     def gate_up(self, prefix: str) -> TiledLinear:
-        g, gs = self._fp8(prefix + ".gate_proj")
-        u, us = self._fp8(prefix + ".up_proj")
-        half = TILE_GATE_UP // 2
-        n, k = g.shape
-        w = torch.stack([g.view(n // half, half, k), u.view(n // half, half, k)], 1).reshape(2 * n, k)
-        del g, u
-        rg = torch.stack([gs.view(n // half, half // 16, -1), us.view(n // half, half // 16, -1)], 1).reshape(
-            2 * n // 16, -1)
-        tl = _tile_fp8(w, rg, TILE_GATE_UP, (("gate", n), ("up", n)))
-        tl.interleave = half
-        return tl
+        return self.fp8_linear([("gate", prefix + ".gate_proj"), ("up", prefix + ".up_proj")], TILE_GATE_UP,
+                               gate_up_order(self.inter, TILE_GATE_UP))
 
     def bf16_linear(self, parts: list[tuple[str, str]], tile_n: int) -> TiledLinear:
         ws = [self.bf16(name) for _, name in parts]
@@ -293,7 +331,7 @@ class _Loader:
         return LinearLayerWeights(
             ln1=self.bf16(p + "input_layernorm.weight"),
             ln2=self.bf16(p + "post_attention_layernorm.weight"),
-            qkvz=self.fp8_linear([("qkv", la + "in_proj_qkv"), ("z", la + "in_proj_z")], TILE_QKVZ),
+            qkvz=self.fp8_linear([("qkv", la + "in_proj_qkv"), ("z", la + "in_proj_z")], TILE_QKVZ, qkvz_order()),
             ab=self.bf16_linear([("b", la + "in_proj_b.weight"), ("a", la + "in_proj_a.weight")], TILE_AB),
             out=self.fp8_linear([("out", la + "out_proj")], TILE_OUT),
             gate_up=self.gate_up(p + "mlp"),
@@ -310,7 +348,8 @@ class _Loader:
         return FullLayerWeights(
             ln1=self.bf16(p + "input_layernorm.weight"),
             ln2=self.bf16(p + "post_attention_layernorm.weight"),
-            qkv=self.fp8_linear([("q", sa + "q_proj"), ("k", sa + "k_proj"), ("v", sa + "v_proj")], TILE_QKV),
+            qkv=self.fp8_linear([("q", sa + "q_proj"), ("k", sa + "k_proj"), ("v", sa + "v_proj")], TILE_QKV,
+                                qkv_order()),
             out=self.fp8_linear([("o", sa + "o_proj")], TILE_OUT),
             gate_up=self.gate_up(p + "mlp"),
             down=self.fp8_linear([("down", p + "mlp.down_proj")], TILE_DOWN),

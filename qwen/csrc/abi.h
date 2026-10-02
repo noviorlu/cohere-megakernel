@@ -27,6 +27,13 @@ typedef uint16_t qmk_bf16;
 #define QMK_LIN_CONV_TAPS 4    // causal conv kernel; state keeps TAPS-1 inputs
 #define QMK_LIN_QKVZ 16384     // fused in_proj_qkv (10240) + in_proj_z (6144)
 #define QMK_LIN_AB 96          // fused in_proj_b (48) + in_proj_a (48)
+// The fused QKVZ rows (and so its output columns) are grouped per key head,
+// so a GDN head only depends on its group's tiles:
+//   group kh (1024 wide): q[kh] (128) | k[kh] (128) | v[3kh..3kh+2] (384) | z[3kh..3kh+2] (384)
+#define QMK_LIN_GROUP 1024
+#define QMK_LIN_GROUP_K 128
+#define QMK_LIN_GROUP_V 256
+#define QMK_LIN_GROUP_Z 640
 
 // Gated full-attention layers
 #define QMK_ATT_NQ 24
@@ -34,6 +41,11 @@ typedef uint16_t qmk_bf16;
 #define QMK_ATT_HD 256
 #define QMK_ATT_ROT 64      // partial rotary: first 64 dims of each head
 #define QMK_ATT_QKV 14336   // fused q_proj+gate (12288) + k (1024) + v (1024)
+// Fused QKV rows grouped per kv head g (3584 wide):
+//   [q head i | gate head i] for the 6 query heads of g (6 x 512) | k[g] (256) | v[g] (256)
+#define QMK_ATT_GROUP 3584
+#define QMK_ATT_GROUP_K 3072
+#define QMK_ATT_GROUP_V 3328
 #define QMK_MIX_OUT 6144    // input width of out_proj / o_proj
 
 // ── kernel structure ────────────────────────────────────────────────────────
@@ -59,9 +71,20 @@ enum QmkEpilogue : int32_t {
 // Counter 0 is the global task ticket.
 #define QMK_CTR_TICKET 0
 
+// Which counter of a range a task waits on / bumps:
+//   key(i) = min(((i / div1) % mod) / div2, kmax)     (mod == 0: skip the modulo)
+// where i is the task index (GEMM signals use the tile index instead).
 typedef struct {
-    int32_t ctr;  // -1: no dependency
-    int32_t val;  // wait until counters[ctr] >= val
+    int32_t div1;
+    int32_t mod;
+    int32_t div2;
+    int32_t kmax;
+} QmkKey;
+
+// Wait until counters[ctr + key] >= targets[ctr + key]; ctr < 0: no dependency.
+typedef struct {
+    int32_t ctr;
+    QmkKey key;
 } QmkDep;
 
 typedef struct {
@@ -69,16 +92,22 @@ typedef struct {
     const float* wscale;    // FP8 only: [tile][chunk][8 warps]
     const qmk_bf16* x;      // input activations [bs][ldx]
     const qmk_bf16* norm_w; // zero-centred RMSNorm weight over K, or NULL
-    const float* ss_in;     // sum-of-squares partials [n_ss][8] for the norm
+    const float* inv_in;    // with norm_w: 1/rms of each input row [8]
     qmk_bf16* out;          // STORE / SILU_MUL output [bs][ldo]
     qmk_bf16* resid;        // RESID: residual stream [bs][ldo]
     float* ss_out;          // RESID: per-tile sum of squares [ntiles][8]
+    float* inv_out;         // RESID: 1/rms of the updated rows [8], written by the last tile
+    float* partial;         // split-K: fp32 partial sums [ksplit][8][N]
     int32_t ldx;
-    int32_t n_ss;
-    int32_t tile_n;         // TN: rows per task (16, 32, 64 or 128)
-    int32_t nchunks;        // 16 KiB chunks per task
+    int32_t norm_ctr;       // RESID: arrival counter of finished tiles
+    int32_t tile_n;         // TN: rows per tile (16, 32, 64 or 128)
+    int32_t nchunks;        // 16 KiB chunks per tile (whole K)
     int32_t epi;
     int32_t ldo;
+    int32_t ntiles;
+    int32_t ksplit;         // task i covers tile i % ntiles, K-split i / ntiles
+    int32_t tile_ctr;       // split-K: first of ntiles arrival counters
+    int32_t pad_;
 } QmkGemmArgs;
 
 typedef struct {
@@ -112,8 +141,9 @@ typedef struct {
     int32_t type;
     int32_t ntasks;
     QmkDep wait[2];
-    int32_t signal;  // counter bumped once per finished task (attention: per combined head group)
-    int32_t pad_;
+    // Bumped when a unit of output is complete: a task (GDN), a tile (GEMM,
+    // after the last K-split) or a (row, kv head) group (attention).
+    QmkDep signal;
     union {
         QmkGemmArgs gemm;
         QmkGdnArgs gdn;
@@ -130,6 +160,7 @@ typedef struct {
     const QmkOpDesc* ops;
     const QmkTask* tasks;
     int32_t* counters;
+    const int32_t* targets;        // completion value of every counter
     int64_t* prof;                 // optional [ntasks][4]: claim, deps-ready, done (globaltimer ns), smid
     int32_t ntasks;
     int32_t bs;

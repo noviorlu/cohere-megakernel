@@ -72,17 +72,19 @@ __device__ __forceinline__ void merge_softmax(float& m, float& l, float* o, floa
     m = M;
 }
 
-// Returns true if this task merged the (b, g) group, i.e. the op's output for it is complete.
+// idx = (g * bs + b) * nsplit + s (kv-group-major, so o_proj's K-split g can
+// start once group g is done). Returns true if this task merged the
+// (b, g) group, i.e. the op's output for it is complete.
 __device__ bool attn_task(const QmkStepParams& P, const QmkAttnArgs& a, int idx, int* counters, AttnScratch& sc) {
     constexpr int HD = QMK_ATT_HD, NKV = QMK_ATT_NKV;
     const int nsplit = a.nsplit;
-    const int s = idx % nsplit, g = (idx / nsplit) % NKV, b = idx / (nsplit * NKV);
+    const int s = idx % nsplit, g = idx / nsplit / P.bs, b = idx / nsplit % P.bs;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int pos = P.pos[b], slot = P.slot[b], ctx = pos + 1;
     const int chunk = (ctx + nsplit - 1) / nsplit;
     const int p0 = s * chunk, p1 = min(ctx, p0 + chunk);
     const bool owns_new = p0 <= pos && pos < p1;
-    const bf16* row = a.qkv + static_cast<size_t>(b) * QMK_ATT_QKV;
+    const bf16* row = a.qkv + static_cast<size_t>(b) * QMK_ATT_QKV + g * QMK_ATT_GROUP;  // grouped per kv head
     const size_t kv_off = static_cast<size_t>(slot * NKV + g) * P.max_ctx * HD;
     bf16* Kc = a.kcache + kv_off;
     bf16* Vc = a.vcache + kv_off;
@@ -91,23 +93,22 @@ __device__ bool attn_task(const QmkStepParams& P, const QmkAttnArgs& a, int idx,
 
     // ── q (warps 0-5), new k (warp 6), new v (warp 7) ──
     if (warp < ATT_GROUP) {
-        const int hq = g * ATT_GROUP + warp;
         float y[8];
-        head_rmsnorm(row + hq * 2 * HD, a.q_norm_w, lane, y);
+        head_rmsnorm(row + warp * 2 * HD, a.q_norm_w, lane, y);
 #pragma unroll
         for (int e = 0; e < 8; ++e) sc.q[warp][lane * 8 + e] = y[e];
         __syncwarp();
         rope_head(sc.q[warp], y, cos, sin, lane);
     } else if (warp == 6 && owns_new) {
         float y[8];
-        head_rmsnorm(row + QMK_ATT_NQ * 2 * HD + g * HD, a.k_norm_w, lane, y);
+        head_rmsnorm(row + QMK_ATT_GROUP_K, a.k_norm_w, lane, y);
 #pragma unroll
         for (int e = 0; e < 8; ++e) sc.kbuf[lane * 8 + e] = y[e];
         __syncwarp();
         rope_head(sc.kbuf, y, cos, sin, lane);
         *reinterpret_cast<uint4*>(Kc + static_cast<size_t>(pos) * HD + lane * 8) = pack_bf16x8(y);
     } else if (warp == 7 && owns_new) {
-        const uint4 v = ldcg_u4(row + (QMK_ATT_NQ * 2 + NKV) * HD + g * HD + lane * 8);
+        const uint4 v = ldcg_u4(row + QMK_ATT_GROUP_V + lane * 8);
         *reinterpret_cast<uint4*>(Vc + static_cast<size_t>(pos) * HD + lane * 8) = v;
     }
     __threadfence();
@@ -215,7 +216,7 @@ __device__ bool attn_task(const QmkStepParams& P, const QmkAttnArgs& a, int idx,
         }
         const int hq = g * ATT_GROUP + i;
         const float attn = round_bf16(O / L);
-        const float gate = __bfloat162float(__ldcg(row + hq * 2 * HD + HD + d));
+        const float gate = __bfloat162float(__ldcg(row + i * 2 * HD + HD + d));
         const float sg = round_bf16(1.0f / (1.0f + expf(-gate)));
         a.out[static_cast<size_t>(b) * QMK_MIX_OUT + hq * HD + d] = __float2bfloat16(attn * sg);
     }

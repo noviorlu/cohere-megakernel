@@ -5,18 +5,12 @@ Run: .venv/bin/python qwen/tests/test_gemm.py
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import torch
+from util import DEV, Launch, gemm_op
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from qmk import layout, native
+from qmk.native import EPI_RESID, EPI_SILU_MUL, EPI_STORE
 
-from qmk import layout, native  # noqa: E402
-from qmk.native import EPI_RESID, EPI_SILU_MUL, EPI_STORE, OP_GEMM_BF16, OP_GEMM_FP8  # noqa: E402
-
-DEV = torch.device("cuda")
-HIDDEN = 5120
 EPS = 1e-6
 
 
@@ -34,7 +28,7 @@ def test_e4m3_exhaustive(lib: native.Lib) -> None:
     print("e4m3→bf16: all 254 finite codes exact")
 
 
-def run_gemm(lib, *, fp8, n, k, tn, bs, epi, norm, seed=0):
+def run_gemm(lib, *, fp8, n, k, tn, bs, epi, norm, ksplit=1, seed=0):
     gen = torch.Generator(device=DEV).manual_seed(seed)
     t = layout.Tiling(n=n, k=k, tile_n=tn, fp8=fp8)
     if fp8:
@@ -52,6 +46,7 @@ def run_gemm(lib, *, fp8, n, k, tn, bs, epi, norm, seed=0):
     norm_w = (torch.randn(k, generator=gen, device=DEV) * 0.1).to(torch.bfloat16) if norm else None
     ss_in = torch.zeros(1, 8, device=DEV)
     if norm:
+        assert k == 5120, "kernel normalises over QMK_HIDDEN"
         ss_in[0, :bs] = x.float().pow(2).sum(-1)
         xin = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + EPS)) * (1 + norm_w.float())
         xin = xin.to(torch.bfloat16).float()
@@ -64,52 +59,23 @@ def run_gemm(lib, *, fp8, n, k, tn, bs, epi, norm, seed=0):
     resid = (torch.randn(bs, n, generator=gen, device=DEV)).to(torch.bfloat16)
     resid0 = resid.clone()
     ss_out = torch.zeros(t.ntiles, 8, device=DEV)
-
-    op = native.OpDesc()
-    op.type = OP_GEMM_FP8 if fp8 else OP_GEMM_BF16
-    op.ntasks = t.ntiles
-    op.wait[0] = native.Dep(-1, 0)
-    op.wait[1] = native.Dep(-1, 0)
-    op.signal = 1
-    g = op.gemm
-    g.w = tiled.data_ptr()
-    g.wscale = scales.data_ptr() if fp8 else None
-    g.x = x.data_ptr()
-    g.ldx = k
-    g.norm_w = norm_w.data_ptr() if norm else None
-    g.ss_in = ss_in.data_ptr()
-    g.n_ss = 1
-    g.tile_n = tn
-    g.nchunks = t.nchunks
-    g.epi = epi
-    g.out = out.data_ptr()
-    g.ldo = out_cols if epi != EPI_RESID else n
-    g.resid = resid.data_ptr()
-    g.ss_out = ss_out.data_ptr()
-    ops = native.ops_to_device([op], DEV)
-    tasks = torch.stack([torch.zeros(t.ntiles, dtype=torch.int32), torch.arange(t.ntiles, dtype=torch.int32)], 1)
-    tasks = native.tasks_to_device(tasks, DEV)
-    counters = torch.zeros(16, dtype=torch.int32, device=DEV)
-
-    p = native.StepParams()
-    p.ops, p.tasks, p.counters = ops.data_ptr(), tasks.data_ptr(), counters.data_ptr()
-    p.ntasks, p.bs, p.max_ctx = t.ntiles, bs, 1
-    lib.launch(p, 170)
+    partial = torch.zeros(ksplit, 8, n, device=DEV)
+    op = gemm_op(t, w=tiled.data_ptr(), scales=scales.data_ptr() if fp8 else None, x=x, epi=epi, out=out,
+                 ldo=out_cols if epi != EPI_RESID else n, norm_w=norm_w, ss_in=ss_in, resid=resid, ss_out=ss_out,
+                 ksplit=ksplit, partial=partial, tile_ctr=2)
+    run = Launch(lib, [op], bs, n_counters=2 + t.ntiles)
+    run()
     torch.cuda.synchronize()
-    assert counters[1].item() == t.ntiles, counters[:2]
+    assert run.counters[1].item() == t.ntiles, run.counters[:2]
 
     if epi == EPI_STORE:
-        want = acc.to(torch.bfloat16)
-        got = out
+        want, got = acc.to(torch.bfloat16), out
     elif epi == EPI_SILU_MUL:
-        half = tn // 2
-        a3 = acc.view(bs, t.ntiles, 2, half)
+        a3 = acc.view(bs, t.ntiles, 2, tn // 2)
         gate, up = a3[:, :, 0].reshape(bs, -1).to(torch.bfloat16), a3[:, :, 1].reshape(bs, -1).to(torch.bfloat16)
-        want = torch.nn.functional.silu(gate) * up
-        got = out
+        want, got = torch.nn.functional.silu(gate) * up, out
     else:
-        want = resid0 + acc.to(torch.bfloat16)
-        got = resid
+        want, got = resid0 + acc.to(torch.bfloat16), resid
         ss_want = want.float().pow(2).view(bs, t.ntiles, tn).sum(-1).T
         torch.testing.assert_close(ss_out[:, :bs], ss_want, rtol=1e-4, atol=1e-3)
     err = (got.float() - want.float()).abs().max().item()
@@ -132,6 +98,10 @@ def main() -> None:
         dict(fp8=True, n=1024, k=5120, tn=64, bs=8, epi=EPI_SILU_MUL, norm=True),
         dict(fp8=False, n=1024, k=5120, tn=64, bs=2, epi=EPI_STORE, norm=True),
         dict(fp8=False, n=96, k=5120, tn=32, bs=8, epi=EPI_STORE, norm=True),
+        # split-K: uneven chunk split (17 chunks / 2) and 4-way
+        dict(fp8=True, n=640, k=17408, tn=16, bs=3, epi=EPI_RESID, norm=False, ksplit=2),
+        dict(fp8=True, n=512, k=6144, tn=32, bs=8, epi=EPI_RESID, norm=False, ksplit=4),
+        dict(fp8=True, n=512, k=5120, tn=32, bs=2, epi=EPI_STORE, norm=True, ksplit=3),
     ]
     for c in cases:
         rel = run_gemm(lib, **c)

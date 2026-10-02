@@ -72,11 +72,12 @@ class Engine:
             raise ValueError("context full")
         x = self.w.embed[torch.tensor(tokens)].to(self.dev, non_blocking=True)
         self.buf.x[:bs] = x
-        self.buf.ss_embed[0, :bs] = x.float().pow(2).sum(-1)
+        self.buf.inv_embed[:bs] = torch.rsqrt(x.float().pow(2).mean(-1) + self.w.cfg.eps)
         sched = self.schedule(bs, self.nsplit_for(bs, max(pos) + 1))
         self._counters.zero_()
         p = native.StepParams()
         p.ops, p.tasks, p.counters = sched.ops.data_ptr(), sched.tasks.data_ptr(), self._counters.data_ptr()
+        p.targets = sched.targets.data_ptr()
         p.ntasks, p.bs, p.max_ctx = sched.ntasks, bs, cache.max_ctx
         p.l2_prefetch_chunks = self.l2_prefetch_chunks
         if profile:

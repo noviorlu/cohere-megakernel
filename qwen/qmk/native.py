@@ -26,8 +26,32 @@ EPI_STORE, EPI_SILU_MUL, EPI_RESID = 0, 1, 2
 CTR_TICKET = 0
 
 
+BIG = 1 << 30
+
+
+class Key(C.Structure):
+    """key(i) = min(((i // div1) % mod) // div2, kmax); mod == 0 skips the modulo."""
+    _fields_ = [("div1", C.c_int32), ("mod", C.c_int32), ("div2", C.c_int32), ("kmax", C.c_int32)]
+
+    def __call__(self, i: int) -> int:
+        v = i // self.div1
+        if self.mod:
+            v %= self.mod
+        return min(v // self.div2, self.kmax)
+
+
+def key(div1: int = BIG, mod: int = 0, div2: int = 1, kmax: int = BIG) -> Key:
+    return Key(div1, mod, div2, kmax)
+
+
+WHOLE = key()  # every task maps to the same counter
+
+
 class Dep(C.Structure):
-    _fields_ = [("ctr", C.c_int32), ("val", C.c_int32)]
+    _fields_ = [("ctr", C.c_int32), ("key", Key)]
+
+
+NO_DEP = Dep(-1, WHOLE)
 
 
 class GemmArgs(C.Structure):
@@ -36,16 +60,22 @@ class GemmArgs(C.Structure):
         ("wscale", C.c_void_p),
         ("x", C.c_void_p),
         ("norm_w", C.c_void_p),
-        ("ss_in", C.c_void_p),
+        ("inv_in", C.c_void_p),
         ("out", C.c_void_p),
         ("resid", C.c_void_p),
         ("ss_out", C.c_void_p),
+        ("inv_out", C.c_void_p),
+        ("partial", C.c_void_p),
         ("ldx", C.c_int32),
-        ("n_ss", C.c_int32),
+        ("norm_ctr", C.c_int32),
         ("tile_n", C.c_int32),
         ("nchunks", C.c_int32),
         ("epi", C.c_int32),
         ("ldo", C.c_int32),
+        ("ntiles", C.c_int32),
+        ("ksplit", C.c_int32),
+        ("tile_ctr", C.c_int32),
+        ("pad_", C.c_int32),
     ]
 
 
@@ -90,8 +120,7 @@ class OpDesc(C.Structure):
         ("type", C.c_int32),
         ("ntasks", C.c_int32),
         ("wait", Dep * 2),
-        ("signal", C.c_int32),
-        ("pad_", C.c_int32),
+        ("signal", Dep),
         ("u", OpArgs),
     ]
 
@@ -105,6 +134,7 @@ class StepParams(C.Structure):
         ("ops", C.c_void_p),
         ("tasks", C.c_void_p),
         ("counters", C.c_void_p),
+        ("targets", C.c_void_p),
         ("prof", C.c_void_p),
         ("ntasks", C.c_int32),
         ("bs", C.c_int32),
@@ -160,6 +190,7 @@ class Lib:
         mine = [
             C.sizeof(OpDesc), OpDesc.u.offset, C.sizeof(GemmArgs), C.sizeof(GdnArgs), C.sizeof(AttnArgs),
             C.sizeof(StepParams), GemmArgs.ldx.offset, AttnArgs.nsplit.offset, StepParams.pos.offset,
+            OpDesc.signal.offset, GemmArgs.ksplit.offset, GemmArgs.norm_ctr.offset,
         ]
         if native[: len(mine)] != mine:
             raise RuntimeError(f"ABI mismatch: native={native[:len(mine)]} ctypes={mine}")

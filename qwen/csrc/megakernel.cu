@@ -72,23 +72,32 @@ __device__ void producer(const QmkStepParams& P, Smem& sm) {
     }
 }
 
-__device__ void wait_deps(const QmkStepParams& P, const QmkOpDesc& op) {
+__device__ __forceinline__ int dep_key(const QmkKey& k, int i) {
+    int v = i / k.div1;
+    if (k.mod > 0) v %= k.mod;
+    return min(v / k.div2, k.kmax);
+}
+
+__device__ void wait_deps(const QmkStepParams& P, const QmkOpDesc& op, int idx) {
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            const QmkDep d = op.wait[i];
+            const QmkDep& d = op.wait[i];
             if (d.ctr < 0) continue;
-            while (ld_acquire(P.counters + d.ctr) < d.val) __nanosleep(64);
+            const int c = d.ctr + dep_key(d.key, idx);
+            const int target = P.targets[c];
+            while (ld_acquire(P.counters + c) < target) __nanosleep(64);
         }
     }
     consumer_sync();
 }
 
-__device__ void signal(const QmkStepParams& P, const QmkOpDesc& op) {
+// `unit`: task index (GDN, attention) or tile index (GEMM) the signal key is computed from.
+__device__ void signal(const QmkStepParams& P, const QmkOpDesc& op, int unit) {
     consumer_sync();
-    if (threadIdx.x == 0 && op.signal >= 0) {
+    if (threadIdx.x == 0 && op.signal.ctr >= 0) {
         __threadfence();
-        atomicAdd(P.counters + op.signal, 1);
+        atomicAdd(P.counters + op.signal.ctr + dep_key(op.signal.key, unit), 1);
     }
 }
 
@@ -111,16 +120,19 @@ __device__ void consumer(const QmkStepParams& P, Smem& sm) {
         const QmkOpDesc& op = P.ops[task.op];
         int64_t* prof = P.prof != nullptr && threadIdx.x == 0 ? P.prof + 4 * static_cast<size_t>(id) : nullptr;
         if (prof) prof[0] = globaltimer();
-        wait_deps(P, op);
+        wait_deps(P, op, task.idx);
         if (prof) prof[1] = globaltimer();
-        bool done = true;
+        int unit = task.idx;  // < 0: output not complete yet (another split will signal)
         switch (op.type) {
-            case QMK_OP_GEMM_FP8: gemm_task<true>(P, op.gemm, task.idx, ring, sm.u.gemm); break;
-            case QMK_OP_GEMM_BF16: gemm_task<false>(P, op.gemm, task.idx, ring, sm.u.gemm); break;
+            case QMK_OP_GEMM_FP8: unit = gemm_task<true>(P, op.gemm, task.idx, ring, sm.u.gemm); break;
+            case QMK_OP_GEMM_BF16: unit = gemm_task<false>(P, op.gemm, task.idx, ring, sm.u.gemm); break;
             case QMK_OP_GDN: gdn_task(P, op.gdn, task.idx, sm.u.gdn); break;
-            case QMK_OP_ATTN: done = attn_task(P, op.attn, task.idx, P.counters, sm.u.attn); break;
+            case QMK_OP_ATTN:
+                if (!attn_task(P, op.attn, task.idx, P.counters, sm.u.attn)) unit = -1;
+                break;
         }
-        if (done) signal(P, op);
+        if (unit >= 0) signal(P, op, unit);
+        else consumer_sync();
         if (prof) {
             prof[2] = globaltimer();
             prof[3] = smid();
@@ -175,6 +187,7 @@ int qmk_abi_layout(int64_t* out, int n) {
         sizeof(QmkOpDesc),          QMK_FIELD(QmkOpDesc, gemm),     sizeof(QmkGemmArgs),
         sizeof(QmkGdnArgs),         sizeof(QmkAttnArgs),            sizeof(QmkStepParams),
         QMK_FIELD(QmkGemmArgs, ldx), QMK_FIELD(QmkAttnArgs, nsplit), QMK_FIELD(QmkStepParams, pos),
+        QMK_FIELD(QmkOpDesc, signal), QMK_FIELD(QmkGemmArgs, ksplit), QMK_FIELD(QmkGemmArgs, norm_ctr),
         static_cast<int64_t>(sizeof(qmk::Smem)),
     };
     const int count = static_cast<int>(sizeof(v) / sizeof(v[0]));

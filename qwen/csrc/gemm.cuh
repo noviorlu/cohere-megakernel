@@ -35,23 +35,35 @@ struct Ring {
 
 struct GemmScratch {
     float red[QMK_CONSUMER_WARPS][16][8];  // per-warp 16x8 accumulators
+    float val[128][8];                     // tile result [row][batch] (fp32)
     float sq[128][8];                      // RESID epilogue: squared outputs
-    float inv_rms[QMK_MAX_BS];
+    int last;
 };
+
+// Chunk range [c0, c1) of K-split `split`.
+__device__ __forceinline__ void split_chunks(const QmkGemmArgs& a, int split, int& c0, int& c1) {
+    c0 = split * a.nchunks / a.ksplit;
+    c1 = (split + 1) * a.nchunks / a.ksplit;
+}
 
 // Producer side: stream this task's chunks into the ring.
 // The ring only holds QMK_STAGES chunks, so on claiming a task the producer
 // also asks L2 to fetch the chunks after those. That keeps DRAM busy while the
 // task waits on its dependencies or behind the previous task, which is what
 // would otherwise idle the memory system at every op boundary and op tail.
-__device__ __forceinline__ void gemm_issue(const QmkGemmArgs& a, int tile, Ring& ring, uint64_t policy,
+__device__ __forceinline__ void gemm_issue(const QmkGemmArgs& a, int idx, Ring& ring, uint64_t policy,
                                            int l2_prefetch_chunks) {
-    const uint8_t* src = static_cast<const uint8_t*>(a.w) + static_cast<size_t>(tile) * a.nchunks * QMK_CHUNK_BYTES;
-    const int pf_end = min(a.nchunks, QMK_STAGES + l2_prefetch_chunks);
+    const int tile = idx % a.ntiles;
+    int c0, c1;
+    split_chunks(a, idx / a.ntiles, c0, c1);
+    const uint8_t* src =
+        static_cast<const uint8_t*>(a.w) + (static_cast<size_t>(tile) * a.nchunks + c0) * QMK_CHUNK_BYTES;
+    const int n = c1 - c0;
+    const int pf_end = min(n, QMK_STAGES + l2_prefetch_chunks);
     if (pf_end > QMK_STAGES)
         bulk_prefetch_l2(src + static_cast<size_t>(QMK_STAGES) * QMK_CHUNK_BYTES,
                          static_cast<uint32_t>(pf_end - QMK_STAGES) * QMK_CHUNK_BYTES);
-    for (int c = 0; c < a.nchunks; ++c) {
+    for (int c = 0; c < n; ++c) {
         mbar_wait(&ring.empty[ring.stage], ring.phase ^ 1);
         mbar_arrive_expect_tx(&ring.full[ring.stage], QMK_CHUNK_BYTES);
         bulk_copy_g2s(ring.data(), src + static_cast<size_t>(c) * QMK_CHUNK_BYTES, QMK_CHUNK_BYTES,
@@ -71,8 +83,10 @@ __device__ __forceinline__ uint4 norm_x8(uint4 v, uint4 w, float inv) {
     return pack_bf16x8(xf);
 }
 
+// Returns the tile index once the tile's output is final (always, unless
+// split-K and another split of this tile is still running), else -1.
 template <bool FP8>
-__device__ void gemm_task(const QmkStepParams& P, const QmkGemmArgs& a, int tile, Ring& ring, GemmScratch& sc) {
+__device__ int gemm_task(const QmkStepParams& P, const QmkGemmArgs& a, int idx, Ring& ring, GemmScratch& sc) {
     constexpr int SUBK = FP8 ? 128 : 64;  // k covered by one warp per chunk
     constexpr int STEPS = SUBK / 32;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -81,18 +95,11 @@ __device__ void gemm_task(const QmkStepParams& P, const QmkGemmArgs& a, int tile
     const int s = warp % S;
     const int KC = S * SUBK;
     const bool row_ok = g < P.bs;
+    const int tile = idx % a.ntiles, split = idx / a.ntiles;
+    int c_begin, c_end;
+    split_chunks(a, split, c_begin, c_end);
 
-    float inv = 1.0f;
-    if (a.norm_w != nullptr) {
-        if (warp < P.bs) {
-            float sum = 0.f;
-            for (int i = lane; i < a.n_ss; i += 32) sum += __ldcg(a.ss_in + i * 8 + warp);
-            sum = warp_sum(sum);
-            if (lane == 0) sc.inv_rms[warp] = rsqrtf(sum / QMK_HIDDEN + QMK_RMS_EPS);
-        }
-        consumer_sync();
-        inv = row_ok ? sc.inv_rms[g] : 0.f;
-    }
+    const float inv = a.norm_w != nullptr && row_ok ? __ldcg(a.inv_in + g) : 0.f;
 
     const bf16* xrow = a.x + static_cast<size_t>(row_ok ? g : 0) * a.ldx;
     const float* scales = FP8 ? a.wscale + static_cast<size_t>(tile) * a.nchunks * QMK_CONSUMER_WARPS + warp : nullptr;
@@ -111,15 +118,15 @@ __device__ void gemm_task(const QmkStepParams& P, const QmkGemmArgs& a, int tile
         }
         if (FP8) next_scale = __ldg(scales + c * QMK_CONSUMER_WARPS);
     };
-    fetch(0);
+    fetch(c_begin);
 
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int c = 0; c < a.nchunks; ++c) {
+    for (int c = c_begin; c < c_end; ++c) {
         uint4 X[STEPS];
 #pragma unroll
         for (int st = 0; st < STEPS; ++st) X[st] = norm && row_ok ? norm_x8(xr[st], wr[st], inv) : xr[st];
         const float scale = next_scale;
-        if (c + 1 < a.nchunks) fetch(c + 1);
+        if (c + 1 < c_end) fetch(c + 1);
 
         mbar_wait(&ring.full[ring.stage], ring.phase);
         const uint8_t* wb = ring.data() + warp * 2048;
@@ -146,6 +153,9 @@ __device__ void gemm_task(const QmkStepParams& P, const QmkGemmArgs& a, int tile
                 mma_bf16_16816(pb, A0.z, A1.z, A0.w, A1.w, X[st].z, X[st].w);
             }
         }
+        // Release the stage: every lane's generic-proxy reads must be ordered
+        // before the producer's next bulk copy (async proxy) into it.
+        fence_proxy_async_smem();
         __syncwarp();
         if (lane == 0) mbar_arrive(&ring.empty[ring.stage]);
         ring.advance();
@@ -160,15 +170,41 @@ __device__ void gemm_task(const QmkStepParams& P, const QmkGemmArgs& a, int tile
     sc.red[warp][g + 8][2 * tig + 1] = acc[3];
     consumer_sync();
 
-    // Sum the S K-slices of row i, batch b.
-    auto value = [&](int i, int b) {
-        const int rg = i >> 4, row = i & 15;
+    // Sum the S K-slices of each (row, batch).
+    const int TN = a.tile_n;
+    for (int e = threadIdx.x; e < TN * 8; e += 256) {
+        const int i = e >> 3, b = e & 7, rg = i >> 4, row = i & 15;
         float v = 0.f;
         for (int k = 0; k < S; ++k) v += sc.red[rg * S + k][row][b];
-        return v;
-    };
+        sc.val[i][b] = v;
+    }
 
-    const int TN = a.tile_n;
+    if (a.ksplit > 1) {
+        // Publish this split's partial; the last split of the tile reduces all
+        // of them in split order (deterministic) and runs the epilogue.
+        for (int e = threadIdx.x; e < TN * 8; e += 256) {
+            const int i = e >> 3, b = e & 7;
+            if (b < P.bs) __stcg(a.partial + (static_cast<size_t>(split) * 8 + b) * a.ntiles * TN + tile * TN + i,
+                                 sc.val[i][b]);
+        }
+        __threadfence();
+        consumer_sync();
+        if (threadIdx.x == 0) sc.last = atomicAdd(P.counters + a.tile_ctr + tile, 1) == a.ksplit - 1;
+        consumer_sync();
+        if (!sc.last) return -1;
+        __threadfence();
+        for (int e = threadIdx.x; e < TN * 8; e += 256) {
+            const int i = e >> 3, b = e & 7;
+            float v = 0.f;
+            if (b < P.bs)
+                for (int k = 0; k < a.ksplit; ++k)
+                    v += __ldcg(a.partial + (static_cast<size_t>(k) * 8 + b) * a.ntiles * TN + tile * TN + i);
+            sc.val[i][b] = v;
+        }
+    }
+    consumer_sync();
+    auto value = [&](int i, int b) { return sc.val[i][b]; };
+
     if (a.epi == QMK_EPI_STORE) {
         for (int e = threadIdx.x; e < TN * 8; e += 256) {
             const int i = e >> 3, b = e & 7;
@@ -203,7 +239,23 @@ __device__ void gemm_task(const QmkStepParams& P, const QmkGemmArgs& a, int tile
             for (int i = 0; i < TN; ++i) sum += sc.sq[i][threadIdx.x];
             a.ss_out[tile * 8 + threadIdx.x] = sum;
         }
+        // The last tile to finish turns the per-tile sums into each row's
+        // 1/rms for the next RMSNorm, then signals the whole op as done (so
+        // consumers read 8 floats instead of summing every tile's partial).
+        __threadfence();
+        consumer_sync();
+        if (threadIdx.x == 0) sc.last = atomicAdd(P.counters + a.norm_ctr, 1) == a.ntiles - 1;
+        consumer_sync();
+        if (!sc.last) return -1;
+        __threadfence();
+        if (warp < P.bs) {
+            float sum = 0.f;
+            for (int t = lane; t < a.ntiles; t += 32) sum += __ldcg(a.ss_out + t * 8 + warp);
+            sum = warp_sum(sum);
+            if (lane == 0) a.inv_out[warp] = rsqrtf(sum / QMK_HIDDEN + QMK_RMS_EPS);
+        }
     }
+    return tile;
 }
 
 }  // namespace qmk

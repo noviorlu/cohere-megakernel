@@ -59,6 +59,12 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
     }
 }
 
+// Order this thread's generic-proxy shared memory accesses before later
+// async-proxy (bulk copy) accesses to the same memory.
+__device__ __forceinline__ void fence_proxy_async_smem() {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 // ── bulk async copy (global → shared), completion via mbarrier tx-count ─────
 
 __device__ __forceinline__ uint64_t policy_evict_first() {
