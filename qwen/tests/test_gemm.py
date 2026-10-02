@@ -44,11 +44,11 @@ def run_gemm(lib, *, fp8, n, k, tn, bs, epi, norm, ksplit=1, seed=0):
         scales = None
     x = (torch.randn(bs, k, generator=gen, device=DEV) * 2).to(torch.bfloat16)
     norm_w = (torch.randn(k, generator=gen, device=DEV) * 0.1).to(torch.bfloat16) if norm else None
-    ss_in = torch.zeros(1, 8, device=DEV)
+    inv_in = torch.zeros(8, device=DEV)
     if norm:
         assert k == 5120, "kernel normalises over QMK_HIDDEN"
-        ss_in[0, :bs] = x.float().pow(2).sum(-1)
-        xin = (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + EPS)) * (1 + norm_w.float())
+        inv_in[:bs] = torch.rsqrt(x.float().pow(2).mean(-1) + EPS)
+        xin = (x.float() * inv_in[:bs].unsqueeze(-1)) * (1 + norm_w.float())
         xin = xin.to(torch.bfloat16).float()
     else:
         xin = x.float()
@@ -59,14 +59,24 @@ def run_gemm(lib, *, fp8, n, k, tn, bs, epi, norm, ksplit=1, seed=0):
     resid = (torch.randn(bs, n, generator=gen, device=DEV)).to(torch.bfloat16)
     resid0 = resid.clone()
     ss_out = torch.zeros(t.ntiles, 8, device=DEV)
+    inv_out = torch.zeros(8, device=DEV)
     partial = torch.zeros(ksplit, 8, n, device=DEV)
+    # For RESID epilogue: norm_ctr is the counter index used by the last-tile
+    # arrival logic; signal goes to counter 1 once when all tiles are done.
+    norm_ctr_idx = 2 + t.ntiles if epi == EPI_RESID else -1
     op = gemm_op(t, w=tiled.data_ptr(), scales=scales.data_ptr() if fp8 else None, x=x, epi=epi, out=out,
-                 ldo=out_cols if epi != EPI_RESID else n, norm_w=norm_w, ss_in=ss_in, resid=resid, ss_out=ss_out,
+                 ldo=out_cols if epi != EPI_RESID else n, norm_w=norm_w, inv_in=inv_in if norm else None,
+                 resid=resid, ss_out=ss_out, inv_out=inv_out if epi == EPI_RESID else None,
+                 norm_ctr=norm_ctr_idx,
                  ksplit=ksplit, partial=partial, tile_ctr=2)
-    run = Launch(lib, [op], bs, n_counters=2 + t.ntiles)
+    n_counters = 2 + t.ntiles + (1 if epi == EPI_RESID else 0)
+    run = Launch(lib, [op], bs, n_counters=n_counters)
     run()
     torch.cuda.synchronize()
-    assert run.counters[1].item() == t.ntiles, run.counters[:2]
+    # RESID epilogue: only the last tile to finish signals (once).
+    # Other epilogues: every tile signals.
+    expected_signals = 1 if epi == EPI_RESID else t.ntiles
+    assert run.counters[1].item() == expected_signals, f"counters[1]={run.counters[1].item()} expected {expected_signals}"
 
     if epi == EPI_STORE:
         want, got = acc.to(torch.bfloat16), out
@@ -78,6 +88,12 @@ def run_gemm(lib, *, fp8, n, k, tn, bs, epi, norm, ksplit=1, seed=0):
         want, got = resid0 + acc.to(torch.bfloat16), resid
         ss_want = want.float().pow(2).view(bs, t.ntiles, tn).sum(-1).T
         torch.testing.assert_close(ss_out[:, :bs], ss_want, rtol=1e-4, atol=1e-3)
+        # Check that inv_out contains correct 1/rms of the updated residual.
+        # The kernel divides by QMK_HIDDEN (5120), so this only makes sense
+        # when n covers the full hidden dim.
+        if n == 5120:
+            inv_want = torch.rsqrt(want.float().pow(2).mean(-1) + EPS)
+            torch.testing.assert_close(inv_out[:bs], inv_want, rtol=1e-4, atol=1e-3)
     err = (got.float() - want.float()).abs().max().item()
     scale = want.float().abs().max().item()
     rel = err / max(scale, 1e-6)
@@ -102,6 +118,8 @@ def main() -> None:
         dict(fp8=True, n=640, k=17408, tn=16, bs=3, epi=EPI_RESID, norm=False, ksplit=2),
         dict(fp8=True, n=512, k=6144, tn=32, bs=8, epi=EPI_RESID, norm=False, ksplit=4),
         dict(fp8=True, n=512, k=5120, tn=32, bs=2, epi=EPI_STORE, norm=True, ksplit=3),
+        # RESID with full hidden dim (n=5120) to verify inv_out (1/rms)
+        dict(fp8=True, n=5120, k=17408, tn=16, bs=4, epi=EPI_RESID, norm=False, ksplit=2),
     ]
     for c in cases:
         rel = run_gemm(lib, **c)

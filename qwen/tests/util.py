@@ -16,7 +16,8 @@ DEV = torch.device("cuda")
 
 
 def gemm_op(t: layout.Tiling, *, w: int, scales: int | None, x: torch.Tensor, epi: int, out: torch.Tensor | None = None,
-            ldo: int = 0, norm_w=None, ss_in=None, n_ss=1, resid=None, ss_out=None, ksplit=1, partial=None,
+            ldo: int = 0, norm_w=None, inv_in=None, resid=None, ss_out=None, inv_out=None,
+            norm_ctr: int = -1, ksplit=1, partial=None,
             tile_ctr=0, wait: Dep = NO_DEP, signal_ctr: int = 1) -> native.OpDesc:
     op = native.OpDesc()
     op.type = OP_GEMM_FP8 if t.fp8 else OP_GEMM_BF16
@@ -27,10 +28,12 @@ def gemm_op(t: layout.Tiling, *, w: int, scales: int | None, x: torch.Tensor, ep
     g.w, g.wscale = w, scales
     g.x, g.ldx = x.data_ptr(), x.shape[1]
     g.norm_w = None if norm_w is None else norm_w.data_ptr()
-    g.ss_in, g.n_ss = (None if ss_in is None else ss_in.data_ptr()), n_ss
+    g.inv_in = None if inv_in is None else inv_in.data_ptr()
     g.out, g.ldo = (None if out is None else out.data_ptr()), ldo
     g.resid = None if resid is None else resid.data_ptr()
     g.ss_out = None if ss_out is None else ss_out.data_ptr()
+    g.inv_out = None if inv_out is None else inv_out.data_ptr()
+    g.norm_ctr = norm_ctr
     g.tile_n, g.nchunks, g.epi, g.ntiles, g.ksplit = t.tile_n, t.nchunks, epi, t.ntiles, ksplit
     g.partial = None if partial is None else partial.data_ptr()
     g.tile_ctr = tile_ctr
