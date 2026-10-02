@@ -16,6 +16,20 @@ from pathlib import Path
 CKPT = Path(__file__).resolve().parents[2] / "models" / "Qwen3.8-27B-FP8"
 
 
+def compilation_config(no_compile: bool) -> dict:
+    """vLLM's default torch.compile + CUDA graphs, made to fit next to 27.6 GiB of weights.
+
+    Inductor's compile-time autotuning allocates example inputs (one is the
+    2.4 GiB embedding-sized tensor) and its combo-kernel benchmarking clones
+    one; neither fits. Lazy autotuning on the real tensors and no combo kernels
+    keep every compiled fusion vLLM normally uses.
+    """
+    if no_compile:  # old baseline: no fusions, full CUDA graphs for decode only
+        return {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}
+    return {"inductor_compile_config": {"combo_kernels": False, "benchmark_combo_kernel": False,
+                                        "triton.autotune_at_compile_time": False}}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bs", type=int, nargs="+", default=[1])
@@ -24,6 +38,7 @@ def main() -> None:
     ap.add_argument("--new0", type=int, default=32)
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--gpu-mem", type=float, default=0.92)
+    ap.add_argument("--no-compile", action="store_true", help="skip torch.compile (the earlier, slower baseline)")
     ap.add_argument("--ssm-state-dtype", default="auto",
                     help="DeltaNet recurrent state dtype; 'bfloat16' halves it (the model config says float32)")
     args = ap.parse_args()
@@ -35,9 +50,7 @@ def main() -> None:
     llm = LLM(str(CKPT), max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_mem,
               limit_mm_per_prompt={"image": 0, "video": 0}, max_num_seqs=max(args.bs),
               enable_prefix_caching=False, mamba_ssm_cache_dtype=args.ssm_state_dtype, max_num_batched_tokens=512, enable_chunked_prefill=True,
-              # torch.compile's autotuner clones a 2.4 GiB input, which does not fit next to
-              # the 27.6 GiB of weights; run uncompiled but with full CUDA graphs for decode.
-              compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"})
+              compilation_config=compilation_config(args.no_compile))
     rng = random.Random(0)
 
     def run(bs: int, n: int) -> float:

@@ -12,30 +12,37 @@ which exist on consumer Blackwell.
 
 ## Results (RTX 5090, ctx ≈ 512, greedy decode)
 
-Decode only: median time of one decode step for the whole batch (prefill is
-done beforehand and not timed; for vLLM, TPOT = (t(160 tokens) − t(32 tokens))
-/ 128, so prefill cancels). Measured back to back on the same machine. The GPU also
-drives the desktop, which preempts compute now and then (+~1 ms/step on some
-runs; `bench.py` also prints the minimum).
+Decode only (prefill is done beforehand and not timed), measured back to back
+on the same machine. Megakernel: median / min GPU time of one decode step for
+the whole batch (CUDA events). vLLM 0.30.0 with its default torch.compile +
+CUDA graphs: GPU time per step from an Nsight Systems trace, and wall-clock
+TPOT = (t(160 tokens) − t(32 tokens)) / 128 from `baseline/vllm_decode.py`.
 
-| batch | megakernel | vLLM 0.30.0 | speedup |
-|---:|---:|---:|---:|
-| 1 | 20.5 ms → 48.7 tok/s | 23.1 ms → 43.3 tok/s | 1.13× |
-| 4 | 21.2 ms → 189 tok/s | 25.6 ms → 156 tok/s | 1.21× |
-| 8 | 22.2 ms → 360 tok/s | 50.8 ms → 157 tok/s ¹ | 2.3× ¹ |
+| batch | megakernel GPU step | vLLM GPU step (nsys) | vLLM TPOT (wall) | speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 20.1 ms (min 19.1) → 49.7 tok/s | 21.1 ms (min 19.9) | 21.0 ms → 47.6 tok/s | ~1.05× |
+| 2 | 20.3 ms (min 19.0) → 98.4 tok/s | — | 22.6 ms → 88.5 tok/s | ~1.11× |
 
-¹ Memory-bound, not a kernel comparison. vLLM keeps 27.6 GiB of weights
-(incl. the 2.4 GiB embedding table) and each sequence also needs ~150 MB of
-fp32 DeltaNet state, so it reports a max concurrency of ~4.4 sequences and
-preempts beyond that (its bs=8 throughput equals its bs=4 throughput). With
-the state in bf16 (`--ssm-state-dtype bfloat16`, deviates from the model's
-fp32 state) and `--max-model-len 704` concurrency rises to 6.4, still < 8:
-bs=8 → 48.8 ms (164 tok/s); bs=6 sits right at the limit and thrashes
-(57.8 ms). The megakernel keeps the embedding table on the CPU and has ~4 GB
-left for 8 sequences. A clean bs>4 comparison needs the desktop's ~1.9 GB of
-VRAM freed (headless / display on another GPU). vLLM ran uncompiled with full decode CUDA
-graphs (`baseline/vllm_decode.py`: torch.compile's autotuner OOMs next to the
-weights) and the PyTorch sampler (FlashInfer's sampler fails to JIT here).
+vLLM's step is GPU-bound: 17.4 ms of its 20.9 ms of kernel time is the FP8
+block-scaled GEMMs (CUTLASS, W8A8 with per-token-group activation quant).
+
+**Correction:** an earlier version of this table claimed 1.13× / 1.21× /
+2.3× at bs 1 / 4 / 8. That vLLM baseline was wrong: it ran *without*
+torch.compile (Inductor's compile-time autotuning ran out of memory next to the
+weights), which leaves ~1,470 unfused elementwise kernels per step, and its
+bs=8 number was dominated by memory pressure. `vllm_decode.py` now keeps
+torch.compile on and avoids the OOM with lazy autotuning and no combo-kernel
+benchmarking (`--no-compile` reproduces the old run).
+
+**Batch > 2 is not measured yet.** With the desktop holding ~1.9 GB of VRAM,
+compiled vLLM fits only ~2.25 concurrent sequences (27.6 GiB of weights incl.
+the 2.4 GiB embedding table, plus ~150 MB of fp32 DeltaNet state per
+sequence). The megakernel fits 8 (embedding table on the CPU) and runs bs=8 at
+22.2 ms/step (360 tok/s), but there is no fair vLLM number to compare yet;
+that needs the desktop's VRAM freed.
+
+The GPU also drives the desktop, which preempts compute now and then (+~1
+ms/step on some runs), hence the minimums.
 
 Floor: the step streams 26.9 GB of weights; at the ~1.65 TB/s the kernel
 reaches in steady state that is ~16.3 ms, so bs=1 runs at ~80% of it. Other
@@ -96,7 +103,8 @@ timelines for one layer.
 
 ## Known limitations / next steps
 
-* Decode is ~20% above the bandwidth floor. Remaining holes per layer: the
+* Decode is ~20% above the bandwidth floor and only ~5% faster than compiled
+  vLLM at bs=1. Remaining holes per layer: the
   hand-off from QKVZ/QKV to out_proj while DeltaNet / attention runs
   (~10–15 µs) and the two RMSNorm barriers (~5 µs each). Tried and dropped
   (slower): interleaving DeltaNet/attention tasks into the QKVZ stream, and L2

@@ -1,8 +1,8 @@
 > [!NOTE]
 > **This fork adds [`qwen/`](qwen/): a decode megakernel for
 > [Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) on a single
-> RTX 5090 (sm_120)** — 48.7 tok/s at batch 1 and 360 tok/s at batch 8,
-> 1.13–1.21× vLLM 0.30 where vLLM is not memory-bound. See
+> RTX 5090 (sm_120)** — ~50 tok/s at batch 1 (~5% faster than compiled
+> vLLM 0.30) and 360 tok/s at batch 8. See
 > [qwen/README.md](qwen/README.md) for usage, design and benchmarks.
 >
 > Everything below is the original README of
