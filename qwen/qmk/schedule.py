@@ -185,7 +185,8 @@ class _Builder:
         return self._add(name, op, groups * self.nsplit, waits, sig_key, range(0, groups * self.nsplit, self.nsplit))
 
 
-def build(w: Weights, cache: Cache, buf: Buffers, bs: int, nsplit: int) -> Schedule:
+def build(w: Weights, cache: Cache, buf: Buffers, bs: int, nsplit: int, validate: bool = False) -> Schedule:
+    """validate: also run check_order (≈0.3 s; the tests turn it on)."""
     assert 1 <= bs <= MAX_BS and 1 <= nsplit <= MAX_NSPLIT
     c = w.cfg
     B = _Builder(bs, nsplit)
@@ -260,7 +261,8 @@ def build(w: Weights, cache: Cache, buf: Buffers, bs: int, nsplit: int) -> Sched
         targets=torch.tensor(B.targets, dtype=torch.int32, device=dev),
         op_names=B.names,
     )
-    check_order(sched, B.ops)
+    if validate:
+        check_order(sched, B.ops)
     return sched
 
 

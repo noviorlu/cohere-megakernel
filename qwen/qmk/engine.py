@@ -15,7 +15,9 @@ MIN_SPLIT_TOKENS = 32  # fewest KV positions worth a separate attention task
 
 
 class Engine:
-    def __init__(self, weights: Weights, slots: int, max_ctx: int, lib: native.Lib | None = None):
+    def __init__(self, weights: Weights, slots: int, max_ctx: int, lib: native.Lib | None = None,
+                 validate_schedules: bool = False):
+        self.validate_schedules = validate_schedules
         self.w = weights
         self.dev = weights.device
         self.lib = lib or native.Lib()
@@ -47,7 +49,8 @@ class Engine:
     def schedule(self, bs: int, nsplit: int) -> schedule.Schedule:
         key = (bs, nsplit)
         if key not in self._schedules:
-            self._schedules[key] = schedule.build(self.w, self.cache, self.buf, bs, nsplit)
+            self._schedules[key] = schedule.build(self.w, self.cache, self.buf, bs, nsplit,
+                                                  validate=self.validate_schedules)
             n = self._schedules[key].n_counters
             if self._counters.numel() < n:
                 self._counters = torch.zeros(n, dtype=torch.int32, device=self.dev)

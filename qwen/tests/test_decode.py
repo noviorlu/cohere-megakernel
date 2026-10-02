@@ -53,7 +53,7 @@ def main() -> None:
 
     tok = AutoTokenizer.from_pretrained(CKPT)
     w = Weights.load(CKPT, DEV, layers=args.layers, log=None)
-    eng = Engine(w, slots=args.bs + 1, max_ctx=args.max_ctx)
+    eng = Engine(w, slots=args.bs + 1, max_ctx=args.max_ctx, validate_schedules=True)
     slots = list(range(1, args.bs + 1))  # leave slot 0 unused to catch slot-indexing bugs
     tokens = []
     for b, s in enumerate(slots):
