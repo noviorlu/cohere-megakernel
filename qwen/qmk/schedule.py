@@ -34,12 +34,6 @@ ATT_GROUP = 6           # query heads per kv head
 LIN_GROUP_ROWS = 1024   # fused QKVZ rows per key head (abi.h QMK_LIN_GROUP)
 ATT_GROUP_ROWS = 3584   # fused QKV rows per kv head (abi.h QMK_ATT_GROUP)
 MAX_KSPLIT = max(KSPLIT_OUT, KSPLIT_O, KSPLIT_DOWN)
-# Interleaving lags, in tiles of the producing GEMM: a consumer task is listed
-# about one claim wave (≈ one task per SM) after the tiles it needs, so they
-# are done by the time it is claimed; the GEMM after it follows half a wave later.
-INTERLEAVE = False  # measured slower so far: busy blocks stall on the idle-only GDN/attn claim
-LAG_TILES = 170
-LAG_AFTER_MIX = 85
 
 
 class Buffers:
@@ -108,10 +102,6 @@ class _Builder:
         self.ops: list[native.OpDesc] = []
         self.names: list[str] = []
         self.ntasks: list[int] = []
-        # Task order = stable sort by (anchor op, position in anchor op's tiles, op, idx).
-        # By default an op's tasks follow all earlier ops; `interleave` pulls some
-        # of them forward into an earlier GEMM's tile stream.
-        self.order_keys: list[torch.Tensor] = []
         self.targets: list[int] = [0]  # counter 0: ticket (no target)
 
     def _alloc(self, n: int) -> int:
@@ -131,34 +121,23 @@ class _Builder:
             self.targets[base + sig_key(u)] += 1
         op.signal = Dep(base, sig_key)
         op.ntasks = ntasks
-        k = len(self.ops)
         self.ops.append(op)
         self.names.append(name)
         self.ntasks.append(ntasks)
-        idx = torch.arange(ntasks, dtype=torch.float64)
-        self.order_keys.append(torch.stack([torch.full_like(idx, k), idx, torch.full_like(idx, k), idx], 1))
         return Signal(base, sig_key)
 
-    def interleave(self, op: int, anchor: int, pos: torch.Tensor) -> None:
-        """List op's tasks inside op `anchor`'s tasks: task i goes right after anchor task floor(pos[i]).
-
-        Positions at or past the anchor's end leave the task in its default place.
-        Callers must only pull a task after everything it depends on.
-        """
-        keys = self.order_keys[op]
-        inside = pos < self.ntasks[anchor]
-        keys[inside, 0] = anchor
-        keys[inside, 1] = pos[inside].floor() + 0.5
-
     def task_order(self) -> torch.Tensor:
-        keys = torch.cat(self.order_keys)
-        task_op = keys[:, 2].to(torch.int32)
-        task_idx = keys[:, 3].to(torch.int32)
-        # lexicographic stable sort on (anchor, pos, op, idx)
-        order = torch.arange(keys.shape[0])
-        for col in (3, 2, 1, 0):
-            order = order[torch.sort(keys[order, col], stable=True).indices]
-        return torch.stack([task_op[order], task_idx[order]], 1)
+        """[n, 3] int32 (op, idx, flags), op-major.
+
+        (Pulling GDN/attention and out-proj tasks forward into the producing
+        GEMM's stream was measured slower: they wait on unfinished inputs while
+        holding a block, and GDN state loads crawl under full DRAM load.)
+        """
+        task_op = torch.repeat_interleave(torch.arange(len(self.ops), dtype=torch.int32), torch.tensor(self.ntasks))
+        task_idx = torch.cat([torch.arange(n, dtype=torch.int32) for n in self.ntasks])
+        gemm = torch.tensor([op.type in (OP_GEMM_FP8, OP_GEMM_BF16) for op in self.ops])
+        flags = (~gemm[task_op.long()]).to(torch.int32) * native.TASK_WAIT_IDLE
+        return torch.stack([task_op, task_idx, flags], 1)
 
     def gemm(self, name, tl: TiledLinear, *, x, ldx, epi, waits, sig_key=WHOLE, ksplit=1, partial=None,
              norm_w=None, inv_in=None, out=None, ldo=0, resid=None, ss_out=None, inv_out=None) -> Signal:
@@ -238,17 +217,6 @@ def build(w: Weights, cache: Cache, buf: Buffers, bs: int, nsplit: int) -> Sched
             out = B.gemm(f"L{i}.out", lw.out, x=buf.mix, ldx=6144, epi=EPI_RESID, resid=buf.x, ldo=H,
                          ss_out=buf.ss_attn, inv_out=buf.inv_attn, ksplit=KSPLIT_OUT, partial=buf.part_mix,
                          waits=[gdn.on(key(div1=ntiles_out))])
-            # GDN head h (key head kh) right after a wave past QKVZ group kh; OUT split j after its heads.
-            n_gdn = 48 * bs
-            kh_of_task = torch.arange(n_gdn) // bs // (nv // c.lin_nk)
-            gdn_pos = ((kh_of_task + 1) * tiles_per_head_group + LAG_TILES).double()
-            if INTERLEAVE:
-                B.interleave(len(B.ops) - 2, len(B.ops) - 3, gdn_pos)
-            last_kh_of_split = (torch.arange(KSPLIT_OUT) + 1) * (c.lin_nk // KSPLIT_OUT) - 1
-            split_pos = (last_kh_of_split + 1) * tiles_per_head_group + LAG_TILES + LAG_AFTER_MIX
-            out_split = torch.arange(ntiles_out * KSPLIT_OUT) // ntiles_out
-            if INTERLEAVE:
-                B.interleave(len(B.ops) - 1, len(B.ops) - 3, split_pos[out_split].double())
         else:
             tiles_per_group = ATT_GROUP_ROWS // lw.qkv.tiling.tile_n
             qkv = B.gemm(f"L{i}.qkv", lw.qkv, x=buf.x, ldx=H, norm_w=lw.ln1, inv_in=inv_prev, epi=EPI_STORE,
@@ -266,14 +234,6 @@ def build(w: Weights, cache: Cache, buf: Buffers, bs: int, nsplit: int) -> Sched
             out = B.gemm(f"L{i}.out", lw.out, x=buf.mix, ldx=6144, epi=EPI_RESID, resid=buf.x, ldo=H,
                          ss_out=buf.ss_attn, inv_out=buf.inv_attn, ksplit=KSPLIT_O, partial=buf.part_mix,
                          waits=[attn.on(key(div1=ntiles_out))])
-            # attention group g a wave past QKV group g; O split g after it.
-            g_of_task = torch.arange(c.nkv * bs * nsplit) // (nsplit * bs)
-            o_split = torch.arange(ntiles_out * KSPLIT_O) // ntiles_out
-            o_pos = (o_split + 1) * tiles_per_group + LAG_TILES + LAG_AFTER_MIX
-            if INTERLEAVE:
-                B.interleave(len(B.ops) - 2, len(B.ops) - 3,
-                             ((g_of_task + 1) * tiles_per_group + LAG_TILES).double())
-                B.interleave(len(B.ops) - 1, len(B.ops) - 3, o_pos.double())
         n_out = lw.out.tiling.ntiles
         assert n_out == buf.ss_attn.shape[0]
         # gate_up tile t produces hidden features [t*TN/2, (t+1)*TN/2); key = the DOWN K-split reading them
@@ -311,7 +271,7 @@ def check_order(sched: Schedule, ops: list[native.OpDesc]) -> None:
     targets = sched.targets.cpu().tolist()
     counters = [0] * len(targets)
     pending: dict[tuple[int, int], int] = {}  # (op, unit) → splits seen
-    for op_i, idx in sched.tasks.cpu().tolist():
+    for op_i, idx, *_ in sched.tasks.cpu().tolist():
         op = ops[op_i]
         for d in op.wait:
             if d.ctr >= 0:

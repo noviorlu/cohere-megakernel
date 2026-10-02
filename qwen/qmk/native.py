@@ -125,8 +125,11 @@ class OpDesc(C.Structure):
     ]
 
 
+TASK_WAIT_IDLE = 1
+
+
 class Task(C.Structure):
-    _fields_ = [("op", C.c_int32), ("idx", C.c_int32)]
+    _fields_ = [("op", C.c_int32), ("idx", C.c_int32), ("flags", C.c_int32), ("pad_", C.c_int32)]
 
 
 class StepParams(C.Structure):
@@ -217,6 +220,8 @@ def ops_to_device(ops: list[OpDesc], device: torch.device) -> torch.Tensor:
 
 
 def tasks_to_device(tasks: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """tasks: int32 [n, 2] (op, idx)."""
-    assert tasks.dtype == torch.int32 and tasks.shape[1] == 2
-    return tasks.contiguous().to(device)
+    """tasks: int32 [n, 2] (op, idx) or [n, 3] (op, idx, flags) → QmkTask[n]."""
+    assert tasks.dtype == torch.int32 and tasks.shape[1] in (2, 3)
+    full = torch.zeros(tasks.shape[0], 4, dtype=torch.int32)
+    full[:, : tasks.shape[1]] = tasks
+    return full.to(device)

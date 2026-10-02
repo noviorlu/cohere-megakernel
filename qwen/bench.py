@@ -95,7 +95,9 @@ def main() -> None:
         kern.append(e0.elapsed_time(e1))
     k = sorted(kern)[len(kern) // 2]
     wl = sorted(wall)[len(wall) // 2]
-    print(f"bs={args.bs} ctx≈{args.ctx}: kernel {k:.2f} ms/step, end-to-end {wl:.2f} ms/step "
+    # The GPU also drives the desktop; graphics preemption only ever adds time,
+    # so the minimum is the cleanest view of the kernel itself.
+    print(f"bs={args.bs} ctx≈{args.ctx}: kernel {k:.2f} ms/step (min {min(kern):.2f}), end-to-end {wl:.2f} ms/step "
           f"→ {args.bs * 1e3 / wl:.1f} tok/s (kernel-only {args.bs * 1e3 / k:.1f} tok/s)")
     weight_bytes = sum(t.w.numel() * t.w.element_size() for lw in w.layers
                        for t in vars(lw).values() if hasattr(t, "tiling")) + w.lm_head.w.numel() * 2

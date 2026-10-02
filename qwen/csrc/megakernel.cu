@@ -46,13 +46,13 @@ __device__ void producer(const QmkStepParams& P, Smem& sm) {
     uint32_t qphase = 0;
     while (true) {
         mbar_wait(&sm.task_empty[q], qphase ^ 1);
-        // Claiming ahead only pays off for GEMMs (their weights start streaming).
-        // A GDN/attention task claimed by a busy block would sit behind that
-        // block's current task while other blocks idle, so leave those to
-        // blocks whose consumers have nothing left to do.
+        // Claiming ahead pays off for GEMMs (their weights start streaming).
+        // A WAIT_IDLE task claimed by a busy block would sit behind that
+        // block's current task while other blocks idle, so leave it to a
+        // block whose consumers have nothing left to do.
         while (true) {
             const int next = *reinterpret_cast<volatile int*>(P.counters + QMK_CTR_TICKET);
-            if (next >= P.ntasks || is_gemm(P.ops[P.tasks[next].op].type)) break;
+            if (next >= P.ntasks || !(P.tasks[next].flags & QMK_TASK_WAIT_IDLE)) break;
             if (*reinterpret_cast<volatile int*>(&sm.finished) == claimed) break;
             __nanosleep(32);
         }

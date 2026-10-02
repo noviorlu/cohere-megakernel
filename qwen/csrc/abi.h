@@ -151,9 +151,16 @@ typedef struct {
     };
 } QmkOpDesc;
 
+// Claim this task only when the block's consumers have nothing left to do
+// (set for GDN/attention tasks at the tail of their producer's stream, where
+// sitting behind a busy block's GEMM would delay everything after them).
+#define QMK_TASK_WAIT_IDLE 1
+
 typedef struct {
     int32_t op;
     int32_t idx;
+    int32_t flags;
+    int32_t pad_;
 } QmkTask;
 
 typedef struct {
