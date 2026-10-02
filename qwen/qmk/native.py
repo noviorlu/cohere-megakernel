@@ -142,7 +142,7 @@ class StepParams(C.Structure):
         ("ntasks", C.c_int32),
         ("bs", C.c_int32),
         ("max_ctx", C.c_int32),
-        ("l2_prefetch_chunks", C.c_int32),
+        ("pad_", C.c_int32),
         ("pos", C.c_int32 * MAX_BS),
         ("slot", C.c_int32 * MAX_BS),
         ("conv_par", C.c_int32 * MAX_BS),

@@ -68,7 +68,7 @@ __device__ void producer(const QmkStepParams& P, Smem& sm) {
         if (id < 0) return;
         const QmkTask task = P.tasks[id];
         const QmkOpDesc& op = P.ops[task.op];
-        if (is_gemm(op.type)) gemm_issue(op.gemm, task.idx, ring, policy, P.l2_prefetch_chunks);
+        if (is_gemm(op.type)) gemm_issue(op.gemm, task.idx, ring, policy);
     }
 }
 

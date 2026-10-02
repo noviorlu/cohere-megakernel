@@ -68,12 +68,10 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=32)
     ap.add_argument("--max-ctx", type=int, default=4096)
     ap.add_argument("--profile", action="store_true")
-    ap.add_argument("--l2-prefetch", type=int, default=0, help="chunks per GEMM task prefetched into L2")
     args = ap.parse_args()
 
     w = Weights.load(CKPT, torch.device("cuda"), log=None)
     eng = Engine(w, slots=args.bs, max_ctx=args.max_ctx)
-    eng.l2_prefetch_chunks = args.l2_prefetch
     gen = torch.Generator().manual_seed(0)
     slots = list(range(args.bs))
     for s in slots:

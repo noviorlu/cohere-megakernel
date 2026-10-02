@@ -47,22 +47,15 @@ __device__ __forceinline__ void split_chunks(const QmkGemmArgs& a, int split, in
 }
 
 // Producer side: stream this task's chunks into the ring.
-// The ring only holds QMK_STAGES chunks, so on claiming a task the producer
-// also asks L2 to fetch the chunks after those. That keeps DRAM busy while the
-// task waits on its dependencies or behind the previous task, which is what
-// would otherwise idle the memory system at every op boundary and op tail.
-__device__ __forceinline__ void gemm_issue(const QmkGemmArgs& a, int idx, Ring& ring, uint64_t policy,
-                                           int l2_prefetch_chunks) {
+// (Also pulling later chunks into L2 early — always, or only while the task
+// waits on its inputs — measured no faster, so the ring is the only lookahead.)
+__device__ __forceinline__ void gemm_issue(const QmkGemmArgs& a, int idx, Ring& ring, uint64_t policy) {
     const int tile = idx % a.ntiles;
     int c0, c1;
     split_chunks(a, idx / a.ntiles, c0, c1);
     const uint8_t* src =
         static_cast<const uint8_t*>(a.w) + (static_cast<size_t>(tile) * a.nchunks + c0) * QMK_CHUNK_BYTES;
     const int n = c1 - c0;
-    const int pf_end = min(n, QMK_STAGES + l2_prefetch_chunks);
-    if (pf_end > QMK_STAGES)
-        bulk_prefetch_l2(src + static_cast<size_t>(QMK_STAGES) * QMK_CHUNK_BYTES,
-                         static_cast<uint32_t>(pf_end - QMK_STAGES) * QMK_CHUNK_BYTES);
     for (int c = 0; c < n; ++c) {
         mbar_wait(&ring.empty[ring.stage], ring.phase ^ 1);
         mbar_arrive_expect_tx(&ring.full[ring.stage], QMK_CHUNK_BYTES);

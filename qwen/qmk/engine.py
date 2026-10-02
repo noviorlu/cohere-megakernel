@@ -24,7 +24,6 @@ class Engine:
         self.torch = TorchModel(weights, self.cache)
         self.num_blocks = torch.cuda.get_device_properties(self.dev).multi_processor_count
         self._schedules: dict[tuple[int, int], schedule.Schedule] = {}
-        self.l2_prefetch_chunks = 0
         self._counters = torch.zeros(1, dtype=torch.int32, device=self.dev)
         self._warmup()
 
@@ -79,7 +78,6 @@ class Engine:
         p.ops, p.tasks, p.counters = sched.ops.data_ptr(), sched.tasks.data_ptr(), self._counters.data_ptr()
         p.targets = sched.targets.data_ptr()
         p.ntasks, p.bs, p.max_ctx = sched.ntasks, bs, cache.max_ctx
-        p.l2_prefetch_chunks = self.l2_prefetch_chunks
         if profile:
             self.last_profile = torch.zeros(sched.ntasks, 4, dtype=torch.int64, device=self.dev)
             self.last_schedule = sched

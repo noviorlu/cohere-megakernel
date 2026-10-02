@@ -172,7 +172,7 @@ typedef struct {
     int32_t ntasks;
     int32_t bs;
     int32_t max_ctx;
-    int32_t l2_prefetch_chunks;    // per claimed GEMM task, chunks beyond the ring pulled into L2 early
+    int32_t pad_;
     int32_t pos[QMK_MAX_BS];       // position of the token being decoded (= tokens already cached)
     int32_t slot[QMK_MAX_BS];      // cache slot of each batch row
     int32_t conv_par[QMK_MAX_BS];  // which conv-state buffer holds the current inputs
