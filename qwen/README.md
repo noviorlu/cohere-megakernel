@@ -12,7 +12,9 @@ which exist on consumer Blackwell.
 
 ## Results (RTX 5090, ctx ≈ 512, greedy decode)
 
-Median decode step, measured back to back on the same machine. The GPU also
+Decode only: median time of one decode step for the whole batch (prefill is
+done beforehand and not timed; for vLLM, TPOT = (t(160 tokens) − t(32 tokens))
+/ 128, so prefill cancels). Measured back to back on the same machine. The GPU also
 drives the desktop, which preempts compute now and then (+~1 ms/step on some
 runs; `bench.py` also prints the minimum).
 
@@ -22,9 +24,16 @@ runs; `bench.py` also prints the minimum).
 | 4 | 21.2 ms → 189 tok/s | 25.6 ms → 156 tok/s | 1.21× |
 | 8 | 22.2 ms → 360 tok/s | 50.8 ms → 157 tok/s ¹ | 2.3× ¹ |
 
-¹ vLLM keeps 27.6 GiB of weights (incl. the vision tower) and gets only
-~4,500 tokens of KV cache, fewer than 8 × 672 needs, so it preempts; the bs=8
-gap is mostly memory, not kernels. vLLM ran uncompiled with full decode CUDA
+¹ Memory-bound, not a kernel comparison. vLLM keeps 27.6 GiB of weights
+(incl. the 2.4 GiB embedding table) and each sequence also needs ~150 MB of
+fp32 DeltaNet state, so it reports a max concurrency of ~4.4 sequences and
+preempts beyond that (its bs=8 throughput equals its bs=4 throughput). With
+the state in bf16 (`--ssm-state-dtype bfloat16`, deviates from the model's
+fp32 state) and `--max-model-len 704` concurrency rises to 6.4, still < 8:
+bs=8 → 48.8 ms (164 tok/s); bs=6 sits right at the limit and thrashes
+(57.8 ms). The megakernel keeps the embedding table on the CPU and has ~4 GB
+left for 8 sequences. A clean bs>4 comparison needs the desktop's ~1.9 GB of
+VRAM freed (headless / display on another GPU). vLLM ran uncompiled with full decode CUDA
 graphs (`baseline/vllm_decode.py`: torch.compile's autotuner OOMs next to the
 weights) and the PyTorch sampler (FlashInfer's sampler fails to JIT here).
 

@@ -24,6 +24,8 @@ def main() -> None:
     ap.add_argument("--new0", type=int, default=32)
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--gpu-mem", type=float, default=0.92)
+    ap.add_argument("--ssm-state-dtype", default="auto",
+                    help="DeltaNet recurrent state dtype; 'bfloat16' halves it (the model config says float32)")
     args = ap.parse_args()
     import random
 
@@ -32,7 +34,7 @@ def main() -> None:
 
     llm = LLM(str(CKPT), max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_mem,
               limit_mm_per_prompt={"image": 0, "video": 0}, max_num_seqs=max(args.bs),
-              enable_prefix_caching=False, max_num_batched_tokens=512, enable_chunked_prefill=True,
+              enable_prefix_caching=False, mamba_ssm_cache_dtype=args.ssm_state_dtype, max_num_batched_tokens=512, enable_chunked_prefill=True,
               # torch.compile's autotuner clones a 2.4 GiB input, which does not fit next to
               # the 27.6 GiB of weights; run uncompiled but with full CUDA graphs for decode.
               compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"})
