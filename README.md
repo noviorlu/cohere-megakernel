@@ -1,3 +1,14 @@
+> [!NOTE]
+> **This fork adds [`qwen/`](qwen/): a decode megakernel for
+> [Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) on a single
+> RTX 5090 (sm_120)** — 48.7 tok/s at batch 1 and 360 tok/s at batch 8,
+> 1.13–1.21× vLLM 0.30 where vLLM is not memory-bound. See
+> [qwen/README.md](qwen/README.md) for usage, design and benchmarks.
+>
+> Everything below is the original README of
+> [cohere-ai/cohere-megakernel](https://github.com/cohere-ai/cohere-megakernel)
+> (Apache-2.0), whose design the Qwen kernel follows; its H100 code is unchanged.
+
 # Megakernel Serving Engine for North Mini Code
 
 **A fully-fledged serving system built around a decode megakernel —
