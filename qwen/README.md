@@ -70,6 +70,10 @@ of VRAM is left for KV cache (64 KB/token) and DeltaNet state (150 MB/sequence).
 
 ## How it works
 
+The full write-up — design, the sm_120 traps, bugs found, optimization
+history and dropped ideas — is in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
+Short version:
+
 * **Block:** 1 producer warp + 8 consumer warps per SM, 170 blocks.
   The producer claims tasks from a global ticket and streams GEMM weights into
   a 4 × 16 KiB shared-memory ring with `cp.async.bulk`; consumers wait on the
